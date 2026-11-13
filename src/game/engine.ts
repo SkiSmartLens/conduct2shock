@@ -68,6 +68,71 @@ export interface EngineCallbacks {
   onFeed: (msg: string, color?: string) => void;
 }
 
+export interface NetworkPlayerSetup extends PlayerSetup {
+  id: string;
+}
+
+export interface NetPlayerState {
+  id: string;
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  hp: number;
+  wet: number;
+  rods: number;
+  kos: number;
+  deaths: number;
+  alive: boolean;
+  weapon: WeaponKind;
+  umbrella: boolean;
+  shaking: boolean;
+  firing: boolean;
+  aimX: number;
+  aimZ: number;
+}
+
+export interface NetEffect {
+  targetId: string;
+  byId: string;
+  kind: "soak" | "damage" | "shock" | "rod" | "stun";
+  amount: number;
+  how?: string;
+  stun?: number;
+}
+
+export interface NetAction {
+  weapon: WeaponKind;
+  x: number;
+  z: number;
+  yaw: number;
+  aimX: number;
+  aimZ: number;
+}
+
+export interface NetDeploy {
+  kind: "duck" | "sprinkler" | "cloud";
+  x: number;
+  y: number;
+  z: number;
+}
+
+export interface NetStorm {
+  phase: "countdown" | "strike";
+  targetId: string | null;
+  at: [number, number, number];
+  maxCond: number;
+  nextIn: number;
+}
+
+export interface MultiplayerOptions {
+  playerId: string;
+  players: NetworkPlayerSetup[];
+  send: (event: string, data: unknown) => void;
+  isCoordinator: () => boolean;
+  elapsed?: number;
+}
+
 export interface WeaponInfo {
   label: string;
   cooldown: number;
@@ -255,6 +320,9 @@ class Character {
   moveDir = new THREE.Vector3();
   aim = new THREE.Vector3();
   wantsFire = false;
+  netId: string | null = null;
+  remote = false;
+  netGoal: NetPlayerState | null = null;
 
   constructor(
     public id: number,
@@ -296,6 +364,7 @@ interface Projectile {
   spin: THREE.Vector3;
   eelSegs?: THREE.Object3D[];
   harmless?: boolean;
+  ghost?: boolean;
 }
 
 interface Debris {
@@ -342,6 +411,10 @@ export class Engine {
   debris: Debris[] = [];
   deploys: Deploy[] = [];
   player: Character;
+  private nextCharId = 1000;
+  private netSendAcc = 0;
+  private netLastSentAt = 0;
+  private netLastSerialized = "";
   sun: THREE.DirectionalLight;
   hemi: THREE.HemisphereLight;
   stormCloud: MiniCloud;
@@ -385,6 +458,7 @@ export class Engine {
     setup: PlayerSetup,
     botCount: number,
     public cb: EngineCallbacks,
+    public net: MultiplayerOptions | null = null,
   ) {
     this.renderer = new THREE.WebGLRenderer({
       canvas,
@@ -438,9 +512,11 @@ export class Engine {
       setup.hat,
       setup.hatColor,
     );
+    this.player.netId = this.net?.playerId ?? "local";
     this.chars.push(this.player);
+    if (this.net) this.matchLeft = Math.max(1, MATCH_SECONDS - (this.net.elapsed ?? 0));
     const usedHats = new Set<HatKind>([setup.hat]);
-    for (let i = 0; i < botCount; i++) {
+    for (let i = 0; i < (this.net ? 0 : botCount); i++) {
       let hat = HATS[(i + 1) % HATS.length]!;
       if (usedHats.has(hat)) hat = HATS.find((h) => !usedHats.has(h)) ?? hat;
       usedHats.add(hat);
@@ -460,6 +536,7 @@ export class Engine {
       this.scene.add(c.model.root);
       this.spawnAt(c, i, this.chars.length);
     });
+    if (this.net) this.setRoster(this.net.players);
 
     this.resize();
     this.resizeObs = new ResizeObserver(() => this.resize());
@@ -520,6 +597,216 @@ export class Engine {
     this.cb.onFeed("⚡ Storm hits whoever conducts best. Stay dry!", "#ffe14d");
     // handy for poking at the game from the console
     (window as unknown as { __c2s: Engine }).__c2s = this;
+  }
+
+  // ---------- online multiplayer ----------
+
+  setRoster(players: NetworkPlayerSetup[]) {
+    if (!this.net) return;
+    const unique = players
+      .filter((p, i) => p.id && players.findIndex((other) => other.id === p.id) === i)
+      .slice(0, 8);
+    const previousIds = new Set(this.chars.map((c) => c.netId));
+    const nextIds = new Set(unique.map((p) => p.id));
+    const membershipChanged =
+      previousIds.size !== nextIds.size || [...nextIds].some((id) => !previousIds.has(id));
+
+    for (let i = this.chars.length - 1; i >= 0; i--) {
+      const c = this.chars[i]!;
+      if (!c.remote || (c.netId && nextIds.has(c.netId))) continue;
+      this.scene.remove(c.model.root);
+      c.meter.dispose();
+      for (let p = this.projectiles.length - 1; p >= 0; p--) {
+        if (this.projectiles[p]!.owner !== c) continue;
+        this.scene.remove(this.projectiles[p]!.obj);
+        this.projectiles.splice(p, 1);
+      }
+      for (let d = this.deploys.length - 1; d >= 0; d--) {
+        if (this.deploys[d]!.owner === c) this.removeDeploy(d, false);
+      }
+      this.chars.splice(i, 1);
+    }
+
+    for (const profile of unique) {
+      if (profile.id === this.net.playerId || this.chars.some((c) => c.netId === profile.id)) continue;
+      const c = new Character(
+        this.nextCharId++,
+        profile.name,
+        profile.color,
+        false,
+        profile.hat,
+        profile.hatColor,
+      );
+      c.netId = profile.id;
+      c.remote = true;
+      this.chars.push(c);
+      this.scene.add(c.model.root);
+    }
+
+    if (membershipChanged) {
+      unique.forEach((profile, index) => {
+        const c = this.chars.find((candidate) => candidate.netId === profile.id);
+        if (c) this.spawnAt(c, index, Math.max(1, unique.length));
+      });
+    }
+  }
+
+  private networkCharacter(id: string | null | undefined): Character | null {
+    return this.chars.find((c) => c.netId === id) ?? null;
+  }
+
+  private localNetworkState(): NetPlayerState {
+    const p = this.player;
+    const round = (n: number, scale = 100) => Math.round(n * scale) / scale;
+    return {
+      id: this.net!.playerId,
+      x: round(p.pos.x),
+      y: round(p.pos.y),
+      z: round(p.pos.z),
+      yaw: round(p.yaw, 1000),
+      hp: Math.max(0, Math.round(p.hp)),
+      wet: Math.round(p.wet),
+      rods: p.rods.length,
+      kos: p.kos,
+      deaths: p.deaths,
+      alive: p.alive,
+      weapon: p.weapon,
+      umbrella: p.umbrellaOpen,
+      shaking: p.shaking,
+      firing: p.wantsFire,
+      aimX: round(p.aim.x),
+      aimZ: round(p.aim.z),
+    };
+  }
+
+  private updateNetwork(dt: number) {
+    if (!this.net || document.hidden) return;
+    this.netSendAcc += dt;
+    const count = Math.max(2, this.chars.length);
+    const interval = 1 / (count <= 5 ? 8 : count === 6 ? 6 : 4);
+    if (this.netSendAcc < interval) return;
+    this.netSendAcc = 0;
+    const state = this.localNetworkState();
+    const serialized = JSON.stringify(state);
+    if (serialized === this.netLastSerialized && this.time - this.netLastSentAt < 1) return;
+    this.netLastSerialized = serialized;
+    this.netLastSentAt = this.time;
+    this.net.send("state", state);
+  }
+
+  applyNetworkState(state: NetPlayerState) {
+    if (!this.net || state.id === this.net.playerId) return;
+    if (![state.x, state.y, state.z, state.yaw, state.hp, state.wet].every(Number.isFinite)) return;
+    const c = this.networkCharacter(state.id);
+    if (!c?.remote) return;
+    const wasAlive = c.alive;
+    c.netGoal = { ...state };
+    if (WEAPON_KINDS.includes(state.weapon)) c.setWeapon(state.weapon);
+    c.wantsFire = Boolean(state.firing);
+    c.shaking = Boolean(state.shaking);
+    c.aim.set(state.aimX, 0, state.aimZ);
+    if (wasAlive && !state.alive) this.ko(c, c, "network");
+    if (!wasAlive && state.alive) {
+      this.spawnAt(c, 0, 8);
+      c.pos.set(state.x, state.y, state.z);
+      c.spawnT = 0.45;
+    }
+    c.hp = state.hp;
+    c.wet = state.wet;
+    c.kos = state.kos;
+    c.deaths = state.deaths;
+    c.alive = state.alive;
+    this.syncRemoteRods(c, Math.max(0, Math.min(3, Math.round(state.rods))));
+  }
+
+  private syncRemoteRods(c: Character, count: number) {
+    while (c.rods.length > count) {
+      const rod = c.rods.pop()!;
+      c.model.rods.remove(rod.mesh);
+    }
+    while (c.rods.length < count) {
+      const rod = buildRod();
+      rod.scale.setScalar(0.75);
+      const a = (c.rods.length / 3) * Math.PI * 2;
+      rod.position.set(Math.cos(a) * 0.45, 1.05, Math.sin(a) * 0.45);
+      rod.rotation.set(0.3, a, 0.4);
+      c.model.rods.add(rod);
+      c.rods.push({ mesh: rod, t: 999 });
+    }
+  }
+
+  playNetworkAction(from: string, action: NetAction) {
+    const c = this.networkCharacter(from);
+    if (!c?.remote || !WEAPON_KINDS.includes(action.weapon)) return;
+    if (![action.x, action.z, action.yaw, action.aimX, action.aimZ].every(Number.isFinite)) return;
+    c.pos.set(action.x, groundHeight(action.x, action.z), action.z);
+    c.yaw = action.yaw;
+    c.aim.set(action.aimX, 0, action.aimZ);
+    c.setWeapon(action.weapon);
+    this.fire(c, true);
+  }
+
+  applyNetworkDeploy(from: string, data: NetDeploy) {
+    const owner = this.networkCharacter(from);
+    if (!owner?.remote || ![data.x, data.y, data.z].every(Number.isFinite)) return;
+    const at = new THREE.Vector3(data.x, data.y, data.z);
+    if (data.kind === "duck") this.deployDuck(at, owner);
+    else if (data.kind === "sprinkler") this.deploySprinkler(at, owner);
+    else if (data.kind === "cloud") this.deployCloud(at, owner);
+  }
+
+  applyNetworkEffect(effect: NetEffect) {
+    if (!this.net || effect.targetId !== this.net.playerId || !Number.isFinite(effect.amount)) return;
+    const by = this.networkCharacter(effect.byId) ?? this.player;
+    const amount = THREE.MathUtils.clamp(effect.amount, 0, 200);
+    if (effect.kind === "soak") {
+      this.soak(this.player, amount, by);
+      if (effect.stun) this.player.stun = Math.max(this.player.stun, effect.stun);
+    } else if (effect.kind === "damage") {
+      if (effect.stun) this.player.stun = Math.max(this.player.stun, effect.stun);
+      this.damage(this.player, amount, by, effect.how ?? "hit");
+    } else if (effect.kind === "shock") {
+      const how = (["taser", "eel", "storm", "cloud"].includes(effect.how ?? "")
+        ? effect.how
+        : "taser") as "taser" | "eel" | "storm" | "cloud";
+      this.shock(this.player, by, amount, how);
+      if (how === "storm") {
+        this.player.charredT = 7;
+        this.player.model.hair.visible = true;
+        this.player.wet = Math.max(0, this.player.wet - 60);
+      }
+    } else if (effect.kind === "rod") {
+      this.attachRod(this.player, by, this.player.pos);
+    } else if (effect.kind === "stun") {
+      this.player.stun = Math.max(this.player.stun, amount);
+    }
+  }
+
+  private sendEffect(target: Character, by: Character, effect: Omit<NetEffect, "targetId" | "byId">) {
+    if (!this.net || !target.remote || !target.netId || !by.netId) return;
+    this.net.send("effect", { ...effect, targetId: target.netId, byId: by.netId });
+  }
+
+  creditNetworkKo(byId: string) {
+    if (this.net && byId === this.net.playerId) this.player.kos++;
+  }
+
+  applyNetworkStorm(data: NetStorm) {
+    if (!this.net || this.net.isCoordinator()) return;
+    if (data.phase === "countdown") {
+      this.stormIn = Math.max(0.1, data.nextIn);
+      this.stormCountdown = true;
+      this.audio.setTense(true);
+      this.audio.siren();
+      this.audio.rumble();
+      this.stormCloud.group.visible = true;
+      this.cb.onFeed("⛈️ STORM INCOMING! Highest conductance gets zapped!", "#ffe14d");
+      return;
+    }
+    this.stormIn = Math.max(8, data.nextIn);
+    this.stormCountdown = false;
+    this.audio.setTense(false);
+    this.strike(data);
   }
 
   // ---------- setup helpers ----------
@@ -621,13 +908,14 @@ export class Engine {
     }
     this.updateAim();
     this.updateInput();
-    for (const c of this.chars) if (!c.isHuman) this.updateAI(c, dt);
+    for (const c of this.chars) if (!c.isHuman && !c.remote) this.updateAI(c, dt);
     const top = this.topConductor();
     for (const c of this.chars) this.updateChar(c, dt, top);
     this.updateProjectiles(dt);
     this.updateDeploys(dt, top);
     this.updateDebris(dt);
     this.updateStorm(dt, top);
+    if (this.net) this.updateNetwork(dt);
     this.fx.update(dt);
     this.updateWorld(dt);
     this.updateCamera(dt);
@@ -910,7 +1198,7 @@ export class Engine {
     c.spawnT = Math.max(0, c.spawnT - dt);
 
     if (!c.alive) {
-      c.respawnT -= dt;
+      if (!c.remote) c.respawnT -= dt;
       // fallen over, lying there with the stars going round
       m.pivot.rotation.x = THREE.MathUtils.lerp(m.pivot.rotation.x, -Math.PI / 2, dt * 6);
       m.pivot.position.y = THREE.MathUtils.lerp(m.pivot.position.y, 0.45, dt * 6);
@@ -923,7 +1211,7 @@ export class Engine {
       m.legR.rotation.x = THREE.MathUtils.lerp(m.legR.rotation.x, -0.2, dt * 5);
       m.armL.rotation.z = THREE.MathUtils.lerp(m.armL.rotation.z, -1.4, dt * 5);
       m.armR.rotation.z = THREE.MathUtils.lerp(m.armR.rotation.z, 1.4, dt * 5);
-      if (c.respawnT <= 0) this.respawn(c);
+      if (!c.remote && c.respawnT <= 0) this.respawn(c);
       c.meter.update(0, c.cond, false, c.isHuman);
       return;
     }
@@ -934,42 +1222,56 @@ export class Engine {
     const inFountain = c.pos.length() < FOUNTAIN_R - 0.2;
     const inOcean = c.pos.length() > SAND_R + 0.4;
     const wetK = THREE.MathUtils.clamp((c.wet - 45) / 55, 0, 1);
-    let speed = 7.5;
-    if (inFountain || inOcean) speed *= 0.55;
-    speed *= 1 - wetK * 0.18;
-    if (c.umbrellaOpen) speed *= 0.75;
-    if (c.weapon === "soaker" && c.soakT > 0) speed *= 0.8;
-    if (c.dashT > 0) {
-      c.dashT -= dt;
+    if (c.remote && c.netGoal) {
+      const old = c.pos.clone();
+      const target = new THREE.Vector3(c.netGoal.x, c.netGoal.y, c.netGoal.z);
+      if (c.pos.distanceTo(target) > 5) c.pos.copy(target);
+      else c.pos.lerp(target, 1 - Math.exp(-12 * dt));
+      c.vel.copy(c.pos).sub(old).divideScalar(Math.max(dt, 0.001));
+      c.moveDir.copy(c.vel).setY(0);
+      if (c.moveDir.lengthSq() > 0.01) c.moveDir.normalize();
     } else {
-      const target = moving ? c.moveDir.clone().multiplyScalar(speed) : new THREE.Vector3();
-      c.vel.x = THREE.MathUtils.damp(c.vel.x, target.x, 14, dt);
-      c.vel.z = THREE.MathUtils.damp(c.vel.z, target.z, 14, dt);
-    }
-    c.pos.addScaledVector(c.vel, dt);
-
-    for (const o of this.world.obstacles) this.pushOut(c.pos, o.x, o.z, o.r + 0.5);
-    for (const o of this.chars) {
-      if (o === c || !o.alive) continue;
-      const dx = c.pos.x - o.pos.x;
-      const dz = c.pos.z - o.pos.z;
-      const d = Math.hypot(dx, dz);
-      if (d < 1.1 && d > 0.0001) {
-        const push = (1.1 - d) * 0.5;
-        c.pos.x += (dx / d) * push;
-        c.pos.z += (dz / d) * push;
-        o.pos.x -= (dx / d) * push;
-        o.pos.z -= (dz / d) * push;
+      let speed = 7.5;
+      if (inFountain || inOcean) speed *= 0.55;
+      speed *= 1 - wetK * 0.18;
+      if (c.umbrellaOpen) speed *= 0.75;
+      if (c.weapon === "soaker" && c.soakT > 0) speed *= 0.8;
+      if (c.dashT > 0) {
+        c.dashT -= dt;
+      } else {
+        const target = moving ? c.moveDir.clone().multiplyScalar(speed) : new THREE.Vector3();
+        c.vel.x = THREE.MathUtils.damp(c.vel.x, target.x, 14, dt);
+        c.vel.z = THREE.MathUtils.damp(c.vel.z, target.z, 14, dt);
       }
+      c.pos.addScaledVector(c.vel, dt);
+
+      for (const o of this.world.obstacles) this.pushOut(c.pos, o.x, o.z, o.r + 0.5);
+      for (const o of this.chars) {
+        if (o === c || !o.alive) continue;
+        const dx = c.pos.x - o.pos.x;
+        const dz = c.pos.z - o.pos.z;
+        const d = Math.hypot(dx, dz);
+        if (d < 1.1 && d > 0.0001) {
+          const push = (1.1 - d) * (o.remote ? 1 : 0.5);
+          c.pos.x += (dx / d) * push;
+          c.pos.z += (dz / d) * push;
+          if (!o.remote) {
+            o.pos.x -= (dx / d) * push;
+            o.pos.z -= (dz / d) * push;
+          }
+        }
+      }
+      const r = c.pos.length();
+      if (r > WALK_R) c.pos.multiplyScalar(WALK_R / r);
+      c.pos.y = groundHeight(c.pos.x, c.pos.z);
     }
-    const r = c.pos.length();
-    if (r > WALK_R) c.pos.multiplyScalar(WALK_R / r);
-    c.pos.y = groundHeight(c.pos.x, c.pos.z);
 
     // ---- facing ----
     const aimDir = c.aim.clone().sub(c.pos);
     const aiming = c.wantsFire || c.throwT >= 0 || c.taserT >= 0 || c.swingT >= 0 || c.soakT > 0;
-    if (aiming && aimDir.lengthSq() > 0.01) {
+    if (c.remote && c.netGoal) {
+      c.yaw = lerpAngle(c.yaw, c.netGoal.yaw, 1 - Math.exp(-dt * 14));
+    } else if (aiming && aimDir.lengthSq() > 0.01) {
       const want = Math.atan2(aimDir.x, aimDir.z);
       c.yaw = lerpAngle(c.yaw, want, 1 - Math.exp(-dt * 18));
     } else if (moving) {
@@ -978,6 +1280,7 @@ export class Engine {
     }
 
     // ---- wetness ----
+    if (!c.remote) {
     if (inFountain || inOcean) {
       if (c.wet < 100) {
         c.wet = Math.min(100, c.wet + dt * 140);
@@ -1042,6 +1345,7 @@ export class Engine {
         );
       }
     }
+    }
     // shivering "brrr" when soaked
     if (wetK > 0.3 && c.zapT < 0 && !c.shaking) {
       c.brrT -= dt;
@@ -1075,6 +1379,7 @@ export class Engine {
 
     // ---- firing ----
     if (
+      !c.remote &&
       c.wantsFire &&
       c.weapon !== "umbrella" &&
       c.cooldowns[c.weapon] <= 0 &&
@@ -1083,6 +1388,15 @@ export class Engine {
       c.swingT < 0
     )
       this.fire(c);
+    if (c.remote && c.wantsFire && c.weapon === "soaker" && c.cooldowns.soaker <= 0) {
+      c.cooldowns.soaker = WEAPONS.soaker.cooldown;
+      c.soakT = 0.2;
+      const nozzle = new THREE.Vector3();
+      c.model.soakerNozzle.getWorldPosition(nozzle);
+      const dir = new THREE.Vector3(Math.sin(c.yaw), 0, Math.cos(c.yaw));
+      this.fx.stream(nozzle, dir, WEAPONS.soaker.range * 0.8);
+      if (c.pos.distanceTo(this.player.pos) < 14) this.audio.spray();
+    }
     c.soakT = Math.max(0, c.soakT - dt);
 
     // =============== animation ===============
@@ -1203,7 +1517,7 @@ export class Engine {
         const q = (t - 0.22) / 0.12;
         aLx = aRx = THREE.MathUtils.lerp(-3.0, 0.7, q);
         pivRx = THREE.MathUtils.lerp(-0.3, 0.45, q);
-        if (c.bucketPending && t >= 0.28) {
+        if (!c.remote && c.bucketPending && t >= 0.28) {
           c.bucketPending = false;
           this.bucketDump(c);
         }
@@ -1520,8 +1834,18 @@ export class Engine {
 
   // ---------- weapons ----------
 
-  private fire(c: Character) {
+  private fire(c: Character, ghost = false) {
     const w = c.weapon;
+    if (!ghost && this.net && c === this.player && w !== "soaker") {
+      this.net.send("action", {
+        weapon: w,
+        x: c.pos.x,
+        z: c.pos.z,
+        yaw: c.yaw,
+        aimX: c.aim.x,
+        aimZ: c.aim.z,
+      } satisfies NetAction);
+    }
     c.cooldowns[w] = WEAPONS[w].cooldown;
     const dir = new THREE.Vector3(Math.sin(c.yaw), 0, Math.cos(c.yaw));
     const origin = c.pos.clone().add(new THREE.Vector3(dir.x * 0.4, 1.4, dir.z * 0.4));
@@ -1531,7 +1855,7 @@ export class Engine {
       this.audio.zap(0.25, 0.8);
       const tip = origin.clone().addScaledVector(dir, 1.2);
       let hitAny = false;
-      for (const o of this.chars) {
+      if (!ghost) for (const o of this.chars) {
         if (o === c || !o.alive) continue;
         const to = o.pos.clone().sub(c.pos);
         const d = to.length();
@@ -1560,7 +1884,7 @@ export class Engine {
       if (nozzle.lengthSq() === 0) nozzle.copy(origin);
       let best: Character | null = null;
       let bestD = WEAPONS.soaker.range;
-      for (const o of this.chars) {
+      if (!ghost) for (const o of this.chars) {
         if (o === c || !o.alive) continue;
         const to = o.pos.clone().sub(c.pos).setY(0);
         const along = to.dot(dir);
@@ -1588,15 +1912,16 @@ export class Engine {
 
     if (w === "bucket") {
       c.swingT = 0;
-      c.bucketPending = true;
+      c.bucketPending = !ghost;
       this.audio.whoosh(0.5);
+      if (ghost) this.fx.splash(origin.clone().addScaledVector(dir, 1.2), 24, 1.1);
       return;
     }
 
     if (w === "duck") {
       const at = c.pos.clone().addScaledVector(dir, 1.3);
       if (at.length() > WALK_R - 1) at.setLength(WALK_R - 1);
-      this.deployDuck(at, c);
+      if (!ghost) this.deployDuck(at, c);
       c.squash = 0.7;
       return;
     }
@@ -1651,6 +1976,7 @@ export class Engine {
       owner: c,
       t: 0,
       spin: new THREE.Vector3(Math.random() * 6 - 3, Math.random() * 6 - 3, Math.random() * 6 - 3),
+      ghost,
     };
     if (eelSegs) proj.eelSegs = eelSegs;
     this.projectiles.push(proj);
@@ -1691,6 +2017,7 @@ export class Engine {
           this.soak(o, 70, c);
           o.squash = 1;
           o.stun = Math.max(o.stun, 0.25);
+          if (c === this.player) this.sendEffect(o, c, { kind: "stun", amount: 0.25 });
           got++;
         }
       }
@@ -1744,7 +2071,7 @@ export class Engine {
       }
       let hit: Character | null = null;
       for (const c of this.chars) {
-        if (p.harmless || c === p.owner || !c.alive) continue;
+        if (p.harmless || p.ghost || c === p.owner || !c.alive) continue;
         const dx = p.pos.x - c.pos.x;
         const dz = p.pos.z - c.pos.z;
         const dy = p.pos.y - c.pos.y - 1.1;
@@ -1802,6 +2129,22 @@ export class Engine {
   private landProjectile(p: Projectile, hit: Character | null, hitObstacle: boolean) {
     const at = p.pos.clone();
     at.y = Math.max(at.y, groundHeight(at.x, at.z) + 0.1);
+    if (p.ghost) {
+      if (p.kind === "balloon") {
+        this.fx.splash(at, 28, 1);
+        this.fx.comic("SPLAT!", at.clone().add(new THREE.Vector3(0, 1.4, 0)), "#4fc3ff");
+      } else if (p.kind === "rod") {
+        this.stickRodInGround(at, p.vel);
+      } else if (p.kind === "eel") {
+        const e = buildEel();
+        e.group.position.copy(at);
+        this.scene.add(e.group);
+        this.debris.push({ obj: e.group, t: 0, life: 3, flop: e.segs });
+      } else {
+        this.fx.smoke(at, 5);
+      }
+      return;
+    }
     if (p.kind === "balloon") {
       this.audio.splash();
       this.fx.splash(at, 28, 1);
@@ -1834,24 +2177,8 @@ export class Engine {
         hit.squash = 1;
         hit.stun = Math.max(hit.stun, 0.35);
         this.damage(hit, 4, p.owner, "rod");
-        if (hit.rods.length < 3) {
-          const rod = buildRod();
-          rod.scale.setScalar(0.75);
-          const a = Math.random() * Math.PI * 2;
-          const y = 0.7 + Math.random() * 0.9;
-          rod.position.set(Math.cos(a) * 0.45, y, Math.sin(a) * 0.45);
-          rod.rotation.set((Math.random() - 0.5) * 1.2, a, (Math.random() - 0.5) * 1.2 + 0.4);
-          hit.model.rods.add(rod);
-          hit.rods.push({ mesh: rod, t: 14 });
-          if (hit.isHuman)
-            this.cb.onFeed(`${p.owner.name} stuck a lightning rod on you!`, "#ffb347");
-        } else {
-          this.dropRod(
-            hit,
-            at.clone().add(new THREE.Vector3(0, 1, 0)),
-            new THREE.Vector3((Math.random() - 0.5) * 4, 4, (Math.random() - 0.5) * 4),
-          );
-        }
+        this.attachRod(hit, p.owner, at);
+        if (p.owner === this.player) this.sendEffect(hit, p.owner, { kind: "rod", amount: 0 });
       } else {
         this.audio.plop();
         if (!hitObstacle)
@@ -1903,6 +2230,26 @@ export class Engine {
     e.group.rotation.y = Math.random() * 6;
     this.scene.add(e.group);
     this.debris.push({ obj: e.group, t: 0, life: 3, flop: e.segs });
+  }
+
+  private attachRod(hit: Character, by: Character, at: THREE.Vector3) {
+    if (hit.rods.length < 3) {
+      const rod = buildRod();
+      rod.scale.setScalar(0.75);
+      const a = Math.random() * Math.PI * 2;
+      const y = 0.7 + Math.random() * 0.9;
+      rod.position.set(Math.cos(a) * 0.45, y, Math.sin(a) * 0.45);
+      rod.rotation.set((Math.random() - 0.5) * 1.2, a, (Math.random() - 0.5) * 1.2 + 0.4);
+      hit.model.rods.add(rod);
+      hit.rods.push({ mesh: rod, t: 14 });
+      if (hit.isHuman) this.cb.onFeed(`${by.name} stuck a lightning rod on you!`, "#ffb347");
+    } else {
+      this.dropRod(
+        hit,
+        at.clone().add(new THREE.Vector3(0, 1, 0)),
+        new THREE.Vector3((Math.random() - 0.5) * 4, 4, (Math.random() - 0.5) * 4),
+      );
+    }
   }
 
   /** A rod that fell off someone: it tumbles to the ground but can't hit anyone. */
@@ -1972,7 +2319,13 @@ export class Engine {
 
   // ---------- deployables ----------
 
+  private broadcastDeploy(kind: NetDeploy["kind"], at: THREE.Vector3, owner: Character) {
+    if (!this.net || owner !== this.player) return;
+    this.net.send("deploy", { kind, x: at.x, y: at.y, z: at.z } satisfies NetDeploy);
+  }
+
   private deployDuck(at: THREE.Vector3, owner: Character) {
+    this.broadcastDeploy("duck", at, owner);
     const obj = buildDuck(true);
     obj.position.copy(at);
     obj.position.y = groundHeight(at.x, at.z);
@@ -2016,6 +2369,7 @@ export class Engine {
   }
 
   private deploySprinkler(at: THREE.Vector3, owner: Character) {
+    this.broadcastDeploy("sprinkler", at, owner);
     const s = buildSprinkler();
     s.group.position.copy(at);
     s.group.position.y = groundHeight(at.x, at.z);
@@ -2041,6 +2395,7 @@ export class Engine {
   }
 
   private deployCloud(at: THREE.Vector3, owner: Character) {
+    this.broadcastDeploy("cloud", at, owner);
     const face = buildMiniCloud(0.95);
     face.group.position.copy(at);
     face.group.position.y = at.y + 0.5;
@@ -2174,6 +2529,7 @@ export class Engine {
     if (before < 60 && c.wet >= 60 && c.isHuman)
       this.cb.onFeed("You're soaked! Press R to shake it off!", "#4fc3ff");
     if (c.isHuman && by !== c && amount > 20) this.audio.hurt(1.1);
+    if (by === this.player) this.sendEffect(c, by, { kind: "soak", amount });
   }
 
   private shock(
@@ -2201,16 +2557,23 @@ export class Engine {
       if (dmg < 8) this.audio.fizzle();
       else this.audio.zap(0.35, Math.min(1.5, 0.6 + dmg / 30));
     }
-    this.damage(target, dmg, by, how);
+    if (this.net && target.remote && (by === this.player || (how === "storm" && this.net.isCoordinator()))) {
+      this.sendEffect(target, by, { kind: "shock", amount: dmg, how });
+    }
+    this.damage(target, dmg, by, how, false);
   }
 
-  private damage(target: Character, dmg: number, by: Character, how: string) {
+  private damage(target: Character, dmg: number, by: Character, how: string, notify = true) {
     if (!target.alive) return;
     target.hp -= dmg;
     target.squash = Math.max(target.squash, 0.8);
     if (target.isHuman) this.fx.shake = Math.max(this.fx.shake, Math.min(1, dmg / 40));
     if (dmg > 0) this.audio.hurt(target.isHuman ? 1 : 0.8 + (target.id % 4) * 0.12);
-    if (target.hp <= 0) this.ko(target, by, how);
+    if (notify && by === this.player) this.sendEffect(target, by, { kind: "damage", amount: dmg, how });
+    if (target.hp <= 0) {
+      if (target.remote && this.net) target.hp = 0;
+      else this.ko(target, by, how);
+    }
   }
 
   private ko(target: Character, by: Character, how: string) {
@@ -2256,9 +2619,14 @@ export class Engine {
       2.2,
     );
     this.fx.stars(target.pos.clone().add(new THREE.Vector3(0, 2, 0)), 7);
-    if (by !== target) by.kos++;
+    if (by !== target && how !== "network") by.kos++;
+    if (this.net && target === this.player && by.remote && by.netId) {
+      this.net.send("ko", { byId: by.netId });
+    }
     const verb =
-      how === "storm"
+      how === "network"
+        ? "was knocked out"
+        : how === "storm"
         ? "got fried by the storm"
         : how === "cloud"
           ? `got zapped by ${by.name}'s pocket storm`
@@ -2326,22 +2694,37 @@ export class Engine {
     if (this.phase === "playing") {
       const prev = this.stormIn;
       this.stormIn -= dt;
-      if (!this.stormCountdown && this.stormIn <= 5) {
-        this.stormCountdown = true;
-        this.audio.setTense(true);
-        this.audio.siren();
-        this.audio.rumble();
-        this.cb.onFeed("⛈️ STORM INCOMING! Highest conductance gets zapped!", "#ffe14d");
-        cloud.group.visible = true;
-        cloud.group.position.set(top ? top.pos.x : 0, 42, top ? top.pos.z - 3.5 : 0);
-      }
-      if (this.stormCountdown && Math.ceil(prev) !== Math.ceil(this.stormIn) && this.stormIn > 0)
-        this.audio.tick(this.stormIn < 2);
-      if (this.stormIn <= 0) {
-        this.strike();
-        this.stormCountdown = false;
-        this.stormIn = 16 + Math.random() * 10;
-        this.audio.setTense(false);
+      const controlsStorm = !this.net || this.net.isCoordinator();
+      if (!controlsStorm) {
+        this.stormIn = Math.max(0, this.stormIn);
+      } else {
+        if (!this.stormCountdown && this.stormIn <= 5) {
+          this.stormCountdown = true;
+          this.audio.setTense(true);
+          this.audio.siren();
+          this.audio.rumble();
+          this.cb.onFeed("⛈️ STORM INCOMING! Highest conductance gets zapped!", "#ffe14d");
+          cloud.group.visible = true;
+          cloud.group.position.set(top ? top.pos.x : 0, 42, top ? top.pos.z - 3.5 : 0);
+          if (this.net) {
+            this.net.send("storm", {
+              phase: "countdown",
+              targetId: top?.char?.netId ?? null,
+              at: top ? [top.pos.x, top.pos.y, top.pos.z] : [0, 0, 0],
+              maxCond: top?.cond ?? 0,
+              nextIn: 5,
+            } satisfies NetStorm);
+          }
+        }
+        if (this.stormCountdown && Math.ceil(prev) !== Math.ceil(this.stormIn) && this.stormIn > 0)
+          this.audio.tick(this.stormIn < 2);
+        if (this.stormIn <= 0) {
+          const nextIn = 16 + Math.random() * 10;
+          this.strike(null, nextIn);
+          this.stormCountdown = false;
+          this.stormIn = nextIn;
+          this.audio.setTense(false);
+        }
       }
     }
     const wantMix = this.stormCountdown ? 1 : 0;
@@ -2395,13 +2778,28 @@ export class Engine {
     }
   }
 
-  strike() {
-    const top = this.topConductor();
+  strike(forced: NetStorm | null = null, nextIn = 16 + Math.random() * 10) {
+    const forcedTarget = forced ? this.networkCharacter(forced.targetId) : null;
+    const forcedPosition = forced ? new THREE.Vector3(...forced.at) : new THREE.Vector3();
+    const forcedDeploy = forced && !forcedTarget
+      ? this.deploys
+          .filter((d) => d.kind === "duck")
+          .sort((a, b) => a.pos.distanceTo(forcedPosition) - b.pos.distanceTo(forcedPosition))[0] ?? null
+      : null;
+    const top: Conductor | null = forced
+      ? {
+          name: forcedTarget?.name ?? "decoy",
+          cond: forced.maxCond,
+          pos: forcedTarget?.pos ?? forcedPosition,
+          char: forcedTarget,
+          deploy: forcedDeploy,
+        }
+      : this.topConductor();
     if (!top) return;
     const maxCond = top.cond;
     // ties among characters are random
     let target: Character | null = top.char;
-    if (target) {
+    if (!forced && target) {
       const ties = this.chars.filter((c) => c.alive && c.cond === maxCond);
       target = ties[Math.floor(Math.random() * ties.length)]!;
     }
@@ -2410,6 +2808,15 @@ export class Engine {
       : undefined;
     this.stormMouthT = 0.6;
     const at = (target ? target.pos : top.pos).clone().add(new THREE.Vector3(0, 1.5, 0));
+    if (!forced && this.net) {
+      this.net.send("storm", {
+        phase: "strike",
+        targetId: target?.netId ?? null,
+        at: [at.x, at.y, at.z],
+        maxCond,
+        nextIn,
+      } satisfies NetStorm);
+    }
     this.fx.lightning(at, 34, cloudFrom);
     this.audio.thunder(target?.isHuman ? 0 : at.distanceTo(this.player.pos));
     this.fx.comic(
