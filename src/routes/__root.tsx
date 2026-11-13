@@ -78,11 +78,15 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "Lovable App" },
-      { name: "description", content: "Lovable Generated Project" },
-      { name: "author", content: "Lovable" },
-      { property: "og:title", content: "Lovable App" },
-      { property: "og:description", content: "Lovable Generated Project" },
+      { title: "Conduct2Shock ⚡" },
+      {
+        name: "description",
+        content:
+          "A comic low-poly arena game: soak your rivals, stick lightning rods on them, and let the storm pick the best conductor.",
+      },
+      { name: "author", content: "conduct2shock" },
+      { property: "og:title", content: "Conduct2Shock ⚡" },
+      { property: "og:description", content: "Get everyone wet. Stay dry. Wait for the storm." },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
       { name: "twitter:site", content: "@Lovable" },

@@ -1,19 +1,20 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { lazy, Suspense, useEffect, useState } from "react";
+
+const Game = lazy(() => import("@/components/Game"));
 
 export const Route = createFileRoute("/")({
-  head: () => ({
-    meta: [
-      { title: "TreeTree" },
-      { name: "description", content: "A blank page." },
-      { property: "og:title", content: "TreeTree" },
-      { property: "og:description", content: "A blank page." },
-      { property: "og:type", content: "website" },
-      { name: "twitter:card", content: "summary" },
-    ],
-  }),
   component: Index,
 });
 
 function Index() {
-  return <div className="min-h-screen bg-background" />;
+  // The game needs WebGL and the window, so it only renders on the client.
+  const [client, setClient] = useState(false);
+  useEffect(() => setClient(true), []);
+  if (!client) return <div className="menu" />;
+  return (
+    <Suspense fallback={<div className="menu" />}>
+      <Game />
+    </Suspense>
+  );
 }
